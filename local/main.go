@@ -10,6 +10,7 @@ import (
 	"os"
 
 	"github.com/dstotijn/go-notion"
+	"github.com/sashabaranov/go-openai"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 )
@@ -72,10 +73,15 @@ func slackEventHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("[INFO] unknow slackevents: %s", event)
 	}
 	response := map[string]string{"message": "OK"}
-	jsonResponse, _ := json.Marshal(response)
+	jsonResponse, err := json.Marshal(response)
+	if err != nil {
+		fmt.Printf("[ERROR] Failed to marshal response: %v", err)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 
-	w.WriteHeader(http.StatusOK)
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
 	w.Write(jsonResponse)
 }
 
@@ -115,7 +121,12 @@ func reactionAddedEventHandler(event *slackevents.ReactionAddedEvent) error {
 			if err != nil {
 				return err
 			}
-			if err := addPageToNotionDB(messages, link); err != nil {
+
+			summarizedText, err := summarizeThreadByChatGPT(messages)
+			if err != nil {
+				return err
+			}
+			if err := addPageToNotionDB(messages, link, summarizedText); err != nil {
 				return err
 			}
 		}
@@ -168,7 +179,38 @@ func getMessagePermalink(channel string, timestamp string) (string, error) {
 	return permalink, nil
 }
 
-func addPageToNotionDB(slackMessages []slack.Message, slackLink string) error {
+func summarizeThreadByChatGPT(messages []slack.Message) (string, error) {
+	var textMessages string
+	textMessages = textMessages + "Write in Japanese\n 300文字にまとめてください. \n"
+
+	for _, message := range messages {
+		textMessages = textMessages + message.Text + "\n\n"
+	}
+	client := openai.NewClient(os.Getenv("OPENAI_API_KEY"))
+	resp, err := client.CreateChatCompletion(
+		context.Background(),
+		openai.ChatCompletionRequest{
+			Model: openai.GPT3Dot5Turbo,
+			Messages: []openai.ChatCompletionMessage{
+				{
+					Role:    openai.ChatMessageRoleSystem,
+					Content: "あなたは一流の編集者です。長い文章を要点を押さえた簡潔な文章にする力があります。",
+				},
+				{
+					Role:    openai.ChatMessageRoleUser,
+					Content: textMessages,
+				},
+			},
+		},
+	)
+	if err != nil {
+		return "", err
+	}
+
+	return resp.Choices[0].Message.Content, nil
+}
+
+func addPageToNotionDB(slackMessages []slack.Message, slackLink string, summarizedText string) error {
 	title := slackMessages[0]
 	notionTitle := []notion.RichText{
 		{
@@ -178,22 +220,41 @@ func addPageToNotionDB(slackMessages []slack.Message, slackLink string) error {
 	}
 
 	children := []notion.Block{}
-	paragraph := notion.Block{
+
+	emoji := "📙"
+	children = append(children, notion.Block{
 		Object: "block",
-		Type:   notion.BlockTypeParagraph,
-		Paragraph: &notion.RichTextBlock{
-			Text: []notion.RichText{
-				{
-					Type: notion.RichTextTypeText,
-					Text: &notion.Text{
-						Content: slackLink,
-						Link:    &notion.Link{URL: slackLink},
+		Type:   notion.BlockTypeCallout,
+		Callout: &notion.Callout{
+			RichTextBlock: notion.RichTextBlock{
+				Text: []notion.RichText{
+					{
+						Type: notion.RichTextTypeText,
+						Text: &notion.Text{Content: "■Slackのやり取り\n"},
+					},
+					{
+						Type: notion.RichTextTypeText,
+						Text: &notion.Text{
+							Content: slackLink,
+							Link:    &notion.Link{URL: slackLink},
+						},
+					},
+					{
+						Type: notion.RichTextTypeText,
+						Text: &notion.Text{Content: "\n\n■要約\n\n"},
+					},
+					{
+						Type: notion.RichTextTypeText,
+						Text: &notion.Text{Content: summarizedText},
 					},
 				},
 			},
+			Icon: &notion.Icon{
+				Type:  notion.IconTypeEmoji,
+				Emoji: &emoji,
+			},
 		},
-	}
-	children = append(children, paragraph)
+	})
 
 	for index, message := range slackMessages {
 		var emoji string
