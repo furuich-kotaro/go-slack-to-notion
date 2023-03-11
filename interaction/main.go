@@ -18,18 +18,21 @@ import (
 type Response events.APIGatewayProxyResponse
 
 func Handler(r events.APIGatewayProxyRequest) (Response, error) {
-
-	if err := verify(r); err != nil {
+	if err := SlackRequestVerifier(r); err != nil {
 		log.Printf("[ERROR] failed to verify payload: %v", err)
 		return Response{StatusCode: 200}, nil
 	}
 
-	body, err := base64.StdEncoding.DecodeString(r.Body)
+	body, err := decodeBody(r.Body)
 	if err != nil {
 		log.Printf("[ERROR] Failed to decode base64 encoded payload: %v", err)
 		return Response{StatusCode: 200}, nil
 	}
 
+	/*
+		Slack sends a payload with a URL encoded body. We need to decode it first
+		https://api.slack.com/apis/connections/events-api#the-events-api__receiving-events
+	*/
 	parameters, err := url.QueryUnescape(string(body)[8:])
 	if err != nil {
 		log.Printf("[ERROR] Failed to decode unescape message from slack: %v", err)
@@ -62,21 +65,42 @@ func Handler(r events.APIGatewayProxyRequest) (Response, error) {
 	return resp, nil
 }
 
-func verify(r events.APIGatewayProxyRequest) error {
-	body, _ := base64.StdEncoding.DecodeString(r.Body)
-
-	header := http.Header{}
-	for k, v := range r.Headers {
-		header.Set(k, v)
-	}
-
-	sv, err := slack.NewSecretsVerifier(header, os.Getenv("SLACK_SIGNING_SECRET"))
+/*
+	SlackRequestVerifier is a function that verifies requests from Slack.
+	It validates the signature included in the Slack request to confirm that the request is from a legitimate source.
+	The function takes an events.APIGatewayProxyRequest object as input and returns an error if the request fails verification.
+*/
+func SlackRequestVerifier(r events.APIGatewayProxyRequest) error {
+	body, err := decodeBody(r.Body)
 	if err != nil {
 		return err
 	}
 
-	sv.Write(body)
+	headers := makeHTTPHeader(r.Headers)
+
+	sv, err := slack.NewSecretsVerifier(headers, os.Getenv("SLACK_SIGNING_SECRET"))
+	if err != nil {
+		return err
+	}
+
+	_, err = sv.Write(body)
+	if err != nil {
+		return err
+	}
+
 	return sv.Ensure()
+}
+
+func decodeBody(body string) ([]byte, error) {
+	return base64.StdEncoding.DecodeString(body)
+}
+
+func makeHTTPHeader(headers map[string]string) http.Header {
+	result := make(http.Header)
+	for key, value := range headers {
+		result.Add(key, value)
+	}
+	return result
 }
 
 func addPageToNotionDB(title string, content string) error {
