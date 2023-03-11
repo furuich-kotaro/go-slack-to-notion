@@ -14,6 +14,15 @@ import (
 	"github.com/slack-go/slack/slackevents"
 )
 
+// http handler function
+func main() {
+	fmt.Println("[INFO] Start Server")
+
+	// http.HandleFunc("/slack/slash_command", SlackCommandHander)
+	http.HandleFunc("/slack/events", slackEventHandler)
+	http.ListenAndServe(":80", nil)
+}
+
 func slackEventHandler(w http.ResponseWriter, r *http.Request) {
 	if err := slackRequestVerifier(r); err != nil {
 		fmt.Printf("[ERROR] failed to verify payload: %v", err)
@@ -28,46 +37,42 @@ func slackEventHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	event, err := slackevents.ParseEvent(json.RawMessage(body), slackevents.OptionNoVerifyToken())
-	innerEvent := event.InnerEvent
-	switch ev := innerEvent.Data.(type) {
-	case *slackevents.ReactionAddedEvent:
-		fmt.Printf("[INFO] Channel: %s", ev.Item.Channel)
-
-		fmt.Println("Messages in thread: START")
-		messages, err := getAllMessagesInThread(ev)
-		if err != nil {
-			fmt.Printf("[ERROR] Failed to getAllMessagesInThread: %v", err)
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		fmt.Println("Messages in thread:")
-		for _, message := range messages {
-			fmt.Println(message.Text)
-		}
-	default:
-		fmt.Printf("[ERROR] unkokn ReactionAddedEvent: %s", ev)
+	eventsAPIEvent, err := slackevents.ParseEvent(json.RawMessage(body), slackevents.OptionNoVerifyToken())
+	if err != nil {
+		fmt.Printf("[ERROR] Invalid request signatur: %v", err)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	// title := message.View.State.Values["notion_title"]["title"].Value
-	// content := message.View.State.Values["notion_content"]["content"].Value
-
-	// if err := addPageToNotionDB(title, content); err != nil {
-	// 	fmt.Printf("[ERROR] Failed to add page to Notion: %v", err)
-	// 	w.WriteHeader(http.StatusOK)
-	// 	return
-	// }
-
-	response := map[string]string{"message": "OK"}
-	jsonResponse, err := json.Marshal(response)
+	personJSON, err := json.Marshal(eventsAPIEvent)
 	if err != nil {
-		// If there was an error creating the response, return an HTTP error
-		http.Error(w, "Error creating JSON response", http.StatusInternalServerError)
+		fmt.Println("Error:", err)
 		return
 	}
+	fmt.Println(string(personJSON))
+
+	if eventsAPIEvent.Type == slackevents.URLVerification {
+		var r *slackevents.ChallengeResponse
+		err := json.Unmarshal([]byte(body), &r)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text")
+		w.Write([]byte(r.Challenge))
+	}
+
+	switch event := eventsAPIEvent.InnerEvent.Data.(type) {
+	case *slackevents.ReactionAddedEvent:
+		err := reactionAddedEventHandler(event)
+		if err != nil {
+			fmt.Printf("[ERROR] Failed to handle ReactionAddedEvent: %v", err)
+		}
+	default:
+		fmt.Printf("[INFO] unknow slackevents: %s", event)
+	}
+	response := map[string]string{"message": "OK"}
+	jsonResponse, _ := json.Marshal(response)
 
 	w.WriteHeader(http.StatusOK)
 	w.Header().Set("Content-Type", "application/json")
@@ -98,6 +103,26 @@ func slackRequestVerifier(r *http.Request) error {
 	return sv.Ensure()
 }
 
+func reactionAddedEventHandler(event *slackevents.ReactionAddedEvent) error {
+	if event.Reaction == "slack-to-notion" {
+		messages, err := getAllMessagesInThread(event)
+		if err != nil {
+			return err
+		}
+
+		if len(messages) != 0 {
+			link, err := getMessagePermalink(event.Item.Channel, event.Item.Timestamp)
+			if err != nil {
+				return err
+			}
+			if err := addPageToNotionDB(messages, link); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 /* get all messages in thread by slack.ReactionAddedEvent */
 func getAllMessagesInThread(event *slackevents.ReactionAddedEvent) ([]slack.Message, error) {
 	api := slack.New(os.Getenv("SLACK_TOKEN"))
@@ -115,6 +140,11 @@ func getAllMessagesInThread(event *slackevents.ReactionAddedEvent) ([]slack.Mess
 		if err != nil {
 			return messages, err
 		}
+
+		if threadMessages[0].Timestamp != threadMessages[0].ThreadTimestamp {
+			break
+		}
+
 		messages = append(messages, threadMessages...)
 
 		if !hasMore {
@@ -125,33 +155,76 @@ func getAllMessagesInThread(event *slackevents.ReactionAddedEvent) ([]slack.Mess
 	return messages, nil
 }
 
-func addPageToNotionDB(title string, content string) error {
-	notionClient := notion.NewClient(os.Getenv("NOTION_TOKEN"))
-	ctx := context.Background()
+func getMessagePermalink(channel string, timestamp string) (string, error) {
+	api := slack.New(os.Getenv("SLACK_TOKEN"))
+
+	permalink, err := api.GetPermalink(&slack.PermalinkParameters{
+		Channel: channel,
+		Ts:      timestamp,
+	})
+	if err != nil {
+		return "", err
+	}
+	return permalink, nil
+}
+
+func addPageToNotionDB(slackMessages []slack.Message, slackLink string) error {
+	title := slackMessages[0]
 	notionTitle := []notion.RichText{
 		{
 			Type: notion.RichTextTypeText,
-			Text: &notion.Text{Content: title},
+			Text: &notion.Text{Content: title.Text},
 		},
 	}
 
-	notionContext := []notion.RichText{
-		{
-			Type: notion.RichTextTypeText,
-			Text: &notion.Text{Content: content},
+	children := []notion.Block{}
+	paragraph := notion.Block{
+		Object: "block",
+		Type:   notion.BlockTypeParagraph,
+		Paragraph: &notion.RichTextBlock{
+			Text: []notion.RichText{
+				{
+					Type: notion.RichTextTypeText,
+					Text: &notion.Text{
+						Content: slackLink,
+						Link:    &notion.Link{URL: slackLink},
+					},
+				},
+			},
 		},
+	}
+	children = append(children, paragraph)
+
+	for index, message := range slackMessages {
+		var emoji string
+		if index == 0 {
+			emoji = "❓"
+		} else {
+			emoji = "📝"
+		}
+
+		children = append(children, notion.Block{
+			Object: "block",
+			Type:   notion.BlockTypeCallout,
+			Callout: &notion.Callout{
+				RichTextBlock: notion.RichTextBlock{
+					Text: []notion.RichText{
+						{
+							Type: notion.RichTextTypeText,
+							Text: &notion.Text{Content: message.Text},
+						},
+					},
+				},
+				Icon: &notion.Icon{
+					Type:  notion.IconTypeEmoji,
+					Emoji: &emoji,
+				},
+			},
+		})
 	}
 
-	children := []notion.Block{
-		{
-			Object:    "block",
-			Type:      notion.BlockTypeParagraph,
-			Paragraph: &notion.RichTextBlock{Text: notionContext},
-		},
-	}
 	properties := &notion.DatabasePageProperties{
-		"title":  notion.DatabasePageProperty{Title: notionTitle},
-		"status": notion.DatabasePageProperty{Select: &notion.SelectOptions{Name: "WIP"}},
+		"Name": notion.DatabasePageProperty{Title: notionTitle},
 	}
 
 	params := notion.CreatePageParams{
@@ -162,17 +235,12 @@ func addPageToNotionDB(title string, content string) error {
 		Children:               children,
 	}
 
-	_, err := notionClient.CreatePage(ctx, params)
+	notionClient := notion.NewClient(os.Getenv("NOTION_TOKEN"))
+
+	_, err := notionClient.CreatePage(context.Background(), params)
 	if err != nil {
 		return err
 	}
 
 	return nil
-}
-
-// http handler function
-func main() {
-	// http.HandleFunc("/slack/slash_command", SlackCommandHander)
-	http.HandleFunc("/slack/events", slackEventHandler)
-	http.ListenAndServe(":80", nil)
 }
