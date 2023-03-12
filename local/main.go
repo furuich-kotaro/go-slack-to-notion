@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/dstotijn/go-notion"
 	"github.com/sashabaranov/go-openai"
@@ -45,13 +46,6 @@ func slackEventHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	personJSON, err := json.Marshal(eventsAPIEvent)
-	if err != nil {
-		fmt.Println("Error:", err)
-		return
-	}
-	fmt.Println(string(personJSON))
-
 	if eventsAPIEvent.Type == slackevents.URLVerification {
 		var r *slackevents.ChallengeResponse
 		err := json.Unmarshal([]byte(body), &r)
@@ -60,7 +54,9 @@ func slackEventHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "text")
+		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(r.Challenge))
+		return
 	}
 
 	switch event := eventsAPIEvent.InnerEvent.Data.(type) {
@@ -75,14 +71,18 @@ func slackEventHandler(w http.ResponseWriter, r *http.Request) {
 	response := map[string]string{"message": "OK"}
 	jsonResponse, err := json.Marshal(response)
 	if err != nil {
-		fmt.Printf("[ERROR] Failed to marshal response: %v", err)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write(jsonResponse)
+	if _, err := w.Write(jsonResponse); err != nil {
+		fmt.Printf("failed to write response: %v", err)
+		return
+	}
+
+	fmt.Printf("[INFO] Done process:")
 }
 
 func slackRequestVerifier(r *http.Request) error {
@@ -180,12 +180,14 @@ func getMessagePermalink(channel string, timestamp string) (string, error) {
 }
 
 func summarizeThreadByChatGPT(messages []slack.Message) (string, error) {
-	var textMessages string
-	textMessages = textMessages + "Write in Japanese\n 300文字にまとめてください. \n"
+	var sb strings.Builder
+	sb.WriteString("Write in Japanese\n 100文字にまとめてください. \n")
 
-	for _, message := range messages {
-		textMessages = textMessages + message.Text + "\n\n"
+	for i := range messages {
+		sb.WriteString(messages[i].Text)
+		sb.WriteString("\n\n")
 	}
+
 	client := openai.NewClient(os.Getenv("OPENAI_API_KEY"))
 	resp, err := client.CreateChatCompletion(
 		context.Background(),
@@ -198,7 +200,7 @@ func summarizeThreadByChatGPT(messages []slack.Message) (string, error) {
 				},
 				{
 					Role:    openai.ChatMessageRoleUser,
-					Content: textMessages,
+					Content: sb.String(),
 				},
 			},
 		},
@@ -220,9 +222,31 @@ func addPageToNotionDB(slackMessages []slack.Message, slackLink string, summariz
 	}
 
 	children := []notion.Block{}
+	children = append(children, createSummarizedNotionCalloutBlock(summarizedText, slackLink))
+	children = append(children, ConvertSlackMessagesToNotionCalloutBlocks(slackMessages)...)
 
+	properties := &notion.DatabasePageProperties{"Name": notion.DatabasePageProperty{Title: notionTitle}}
+	params := notion.CreatePageParams{
+		ParentID:               os.Getenv("NOTION_DATABASE"),
+		ParentType:             notion.ParentTypeDatabase,
+		Title:                  notionTitle,
+		DatabasePageProperties: properties,
+		Children:               children,
+	}
+
+	notionClient := notion.NewClient(os.Getenv("NOTION_TOKEN"))
+	_, err := notionClient.CreatePage(context.Background(), params)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// createSummarizedNotionCalloutBlock creates a notion.Callout block that contains summarized text and slack link
+func createSummarizedNotionCalloutBlock(summarizedText string, slackLink string) notion.Block {
 	emoji := "📙"
-	children = append(children, notion.Block{
+	return notion.Block{
 		Object: "block",
 		Type:   notion.BlockTypeCallout,
 		Callout: &notion.Callout{
@@ -254,8 +278,12 @@ func addPageToNotionDB(slackMessages []slack.Message, slackLink string, summariz
 				Emoji: &emoji,
 			},
 		},
-	})
+	}
+}
 
+// ConvertSlackMessagesToNotionCalloutBlocks convert slack messages to notion callout blocks
+func ConvertSlackMessagesToNotionCalloutBlocks(slackMessages []slack.Message) []notion.Block {
+	var children []notion.Block
 	for index, message := range slackMessages {
 		var emoji string
 		if index == 0 {
@@ -283,25 +311,5 @@ func addPageToNotionDB(slackMessages []slack.Message, slackLink string, summariz
 			},
 		})
 	}
-
-	properties := &notion.DatabasePageProperties{
-		"Name": notion.DatabasePageProperty{Title: notionTitle},
-	}
-
-	params := notion.CreatePageParams{
-		ParentID:               os.Getenv("NOTION_DATABASE"),
-		ParentType:             notion.ParentTypeDatabase,
-		Title:                  notionTitle,
-		DatabasePageProperties: properties,
-		Children:               children,
-	}
-
-	notionClient := notion.NewClient(os.Getenv("NOTION_TOKEN"))
-
-	_, err := notionClient.CreatePage(context.Background(), params)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return children
 }
