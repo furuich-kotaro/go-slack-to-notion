@@ -18,10 +18,11 @@ import (
 type Response events.APIGatewayProxyResponse
 
 func Handler(r events.APIGatewayProxyRequest) (Response, error) {
-	if err := SlackRequestVerifier(r); err != nil {
+	if err := slackRequestVerifier(r); err != nil {
 		log.Printf("[ERROR] failed to verify payload: %v", err)
 		return Response{StatusCode: 200}, nil
 	}
+	log.Printf("[INFO] Done slackRequestVerifier")
 
 	body, err := decodeBody(r.Body)
 	if err != nil {
@@ -70,24 +71,18 @@ func Handler(r events.APIGatewayProxyRequest) (Response, error) {
 	It validates the signature included in the Slack request to confirm that the request is from a legitimate source.
 	The function takes an events.APIGatewayProxyRequest object as input and returns an error if the request fails verification.
 */
-func SlackRequestVerifier(r events.APIGatewayProxyRequest) error {
-	body, err := decodeBody(r.Body)
+func slackRequestVerifier(r events.APIGatewayProxyRequest) error {
+	header := http.Header{}
+	for k, v := range r.Headers {
+		header.Set(k, v)
+	}
+
+	sv, err := slack.NewSecretsVerifier(header, os.Getenv("SLACK_SIGNING_SECRET"))
 	if err != nil {
 		return err
 	}
 
-	headers := makeHTTPHeader(r.Headers)
-
-	sv, err := slack.NewSecretsVerifier(headers, os.Getenv("SLACK_SIGNING_SECRET"))
-	if err != nil {
-		return err
-	}
-
-	_, err = sv.Write(body)
-	if err != nil {
-		return err
-	}
-
+	sv.Write([]byte(r.Body))
 	return sv.Ensure()
 }
 
@@ -128,8 +123,7 @@ func addPageToNotionDB(title string, content string) error {
 		},
 	}
 	properties := &notion.DatabasePageProperties{
-		"title":  notion.DatabasePageProperty{Title: notionTitle},
-		"status": notion.DatabasePageProperty{Select: &notion.SelectOptions{Name: "WIP"}},
+		"Name": notion.DatabasePageProperty{Title: notionTitle},
 	}
 
 	params := notion.CreatePageParams{

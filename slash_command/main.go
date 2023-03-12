@@ -13,18 +13,23 @@ import (
 	"github.com/slack-go/slack"
 )
 
+// Response is the response struct for the lambda function
 type Response events.APIGatewayProxyResponse
 
+// Handler is the main function for the lambda function
 func Handler(r events.APIGatewayProxyRequest) (Response, error) {
 
-	if err := verify(r); err != nil {
+	if err := slackRequestVerifier(r); err != nil {
 		log.Printf("[ERROR] failed to verify payload: %v", err)
 		return Response{StatusCode: 200}, nil
 	}
+	log.Printf("[INFO] Done slackRequestVerifier")
 
 	payload := buildPayloadMap(r.Body)
 
 	inputModal := createInputModal()
+	log.Printf("[INFO] Done createInputModal")
+
 	slackClient := slack.New(os.Getenv("SLACK_TOKEN"))
 	if _, err := slackClient.OpenView(payload["trigger_id"], *inputModal); err != nil {
 		log.Printf("[ERROR] failed to open modal: %v", err)
@@ -47,8 +52,7 @@ func buildPayloadMap(body string) map[string]string {
 	return payload
 }
 
-func verify(r events.APIGatewayProxyRequest) error {
-
+func slackRequestVerifier(r events.APIGatewayProxyRequest) error {
 	header := http.Header{}
 	for k, v := range r.Headers {
 		header.Set(k, v)
